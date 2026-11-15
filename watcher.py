@@ -57,32 +57,32 @@ def notify(title: str, body: str, click_url: str, img_url: str = "", urgent: boo
         print(f"Bildirim hatasi: {e}")
 
 
-def apply_female_kitten_filter(target) -> bool:
-    try:
-        sex_btn = target.get_by_text("Sex", exact=True)
-        if sex_btn.count() == 0:
-            return False
-        sex_btn.first.click()
-        target.wait_for_timeout(700)
-        target.get_by_text("Female", exact=True).first.click()
-        target.wait_for_timeout(500)
-        target.get_by_text("Done", exact=True).first.click()
-        target.wait_for_timeout(1000)
+def select_filter_option(scope, button_label: str, option_label: str) -> bool:
+    """Gorunur filtre butonunu acar, secenek varsa isaretler ve gorunur Done butonuna basar."""
+    btn = scope.locator("button:visible, [role='button']:visible", has_text=re.compile(rf"^{button_label}$", re.I))
+    if btn.count() == 0:
+        return False
+    btn.first.click()
+    scope.wait_for_timeout(700)
 
-        age_btn = target.get_by_text("Age Group", exact=True)
-        age_btn.first.click()
-        target.wait_for_timeout(700)
-        target.get_by_text("Kitten", exact=True).first.click()
-        target.wait_for_timeout(500)
-        target.get_by_text("Done", exact=True).first.click()
-        target.wait_for_timeout(2000)
-        return True
-    except Exception as e:
-        print(f"Filtre uyarisi: {e}")
+    opt = scope.locator(":visible", has_text=re.compile(rf"^{option_label}$", re.I))
+    if opt.count() == 0:
+        # Secenek yoksa (ornegin o an hic Female yoksa) menuyu kapat
+        btn.first.click()
+        scope.wait_for_timeout(400)
         return False
 
+    opt.last.click()
+    scope.wait_for_timeout(500)
 
-def extract_cards_from_frame(frame, source_name: str, fallback_url: str) -> dict:
+    done_btn = scope.locator("button:visible", has_text=re.compile(r"^Done$", re.I))
+    if done_btn.count() > 0:
+        done_btn.first.click()
+        scope.wait_for_timeout(1200)
+    return True
+
+
+def extract_visible_cats(scope, source_name: str, fallback_url: str) -> dict:
     found = {}
     ignore_names = {
         "back to all available cats",
@@ -95,46 +95,41 @@ def extract_cards_from_frame(frame, source_name: str, fallback_url: str) -> dict
         "sort",
         "reset",
         "done",
+        "english",
     }
 
-    # 1. Link iceren hayvan kartlarini tara
-    for link in frame.query_selector_all("a[href]"):
-        href = link.get_attribute("href") or ""
-        name = re.sub(r"\s+", " ", (link.inner_text() or "")).strip()
+    imgs = scope.locator("img:visible")
+    count = imgs.count()
+    for i in range(count):
+        img = imgs.nth(i)
+        src = img.get_attribute("src") or ""
+        if not src or "logo" in src.lower() or "acct" in src.lower() or "wp-content" in src.lower():
+            continue
+
+        # Resmin bagli oldugu kart kapsayicisindan kedi adini ve varsa linkini al
+        card_info = img.evaluate(
+            """el => {
+                const card = el.closest('a, button, [role="button"], div[class*="card"], div[class*="animal"], div');
+                if (!card) return { name: '', href: '' };
+                const link = card.closest('a') || card.querySelector('a');
+                return {
+                    name: (card.innerText || '').trim(),
+                    href: link ? (link.href || '') : ''
+                };
+            }"""
+        )
+        name = re.sub(r"\s+", " ", card_info.get("name", "")).strip()
+        href = card_info.get("href", "")
         if not name or len(name) < 2 or len(name) > 40 or name.lower() in ignore_names:
             continue
-        img_el = link.query_selector("img")
-        if not img_el and "shelterluv" not in href.lower() and "animal" not in href.lower():
-            continue
-        img_url = (img_el.get_attribute("src") or "") if img_el else ""
-        full_url = href if href.startswith("http") else fallback_url
-        key = f"{source_name}:{name}:{href}"
+
+        key = f"{source_name}:{name}:{src.split('?')[0]}"
         found[key] = {
             "name": name,
             "source": source_name,
-            "url": full_url,
-            "img_url": img_url,
+            "url": href if href.startswith("http") else fallback_url,
+            "img_url": src,
         }
-
-    # 2. Shelterluv kartlari <a> yerine <div>/button olarak render edildiyse yakala
-    if not found:
-        for img in frame.query_selector_all("img"):
-            src = img.get_attribute("src") or ""
-            if not src or "logo" in src.lower() or "acct" in src.lower():
-                continue
-            parent = img.evaluate_handle("el => el.closest('a, button, [role=\"button\"], div')")
-            if not parent:
-                continue
-            text = re.sub(r"\s+", " ", (parent.as_element().inner_text() or "")).strip()
-            if 2 <= len(text) <= 35 and text.lower() not in ignore_names:
-                key = f"{source_name}:{text}"
-                found[key] = {
-                    "name": text,
-                    "source": source_name,
-                    "url": fallback_url,
-                    "img_url": src,
-                }
-
     return found
 
 
@@ -155,19 +150,30 @@ def scrape_kittens(page) -> dict:
         if not loaded:
             continue
 
-        for frame in page.frames:
-            if apply_female_kitten_filter(frame):
-                cards = extract_cards_from_frame(frame, source_name, url)
+        # Hem ana sayfayi hem olasi iframe'leri tara
+        scopes = [page] + [f for f in page.frames if f != page.main_frame]
+        for scope in scopes:
+            sex_btn = scope.locator("button:visible, [role='button']:visible", has_text=re.compile(r"^Sex$", re.I))
+            if sex_btn.count() == 0:
+                continue
+
+            has_female = select_filter_option(scope, "Sex", "Female")
+            has_kitten = select_filter_option(scope, "Age Group", "Kitten") if has_female else False
+
+            if has_female and has_kitten:
+                cards = extract_visible_cats(scope, source_name, url)
                 print(f"[{source_name}] Filtrelenen disi yavru sayisi: {len(cards)}")
                 results.update(cards)
-                break
+            else:
+                print(f"[{source_name}] Su an eslesen Female + Kitten bulunamadi (0 kayit).")
+            break
 
     return results
 
 
 def main():
+    is_initial = not os.path.exists(STATE_FILE)
     seen = load_seen()
-    is_initial = len(seen) == 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -186,17 +192,13 @@ def main():
         current = scrape_kittens(page)
         browser.close()
 
-    if not current:
-        print("Su an filtrelenmis disi yavru bulunamadi veya liste bos dondu.")
-        return
-
     if is_initial:
         save_seen(current)
-        names = ", ".join(f"{v['name']} ({v['source']})" for v in current.values())
+        names = ", ".join(f"{v['name']} ({v['source']})" for v in current.values()) or "su an 0 disi yavru var"
         print(f"Ilk kayit tamamlandi: {names}")
         notify(
             title="✅ ACCT Takip Botu Aktif",
-            body=f"Su anki {len(current)} disi yavru kaydedildi ({names}). Yeni bir dişi yavru dustugunde aninda bildirim gelecek.",
+            body=f"Tarama basladi ({names}). Yeni bir disi yavru dustugunde aninda bildirim gelecek.",
             click_url=URLS[0][1],
         )
         return
