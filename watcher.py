@@ -10,7 +10,7 @@ URLS = [
     ("Main Facility", "https://acctphilly.org/available-cats/available-cats-main-facility/"),
     ("Offsite", "https://acctphilly.org/available-cats/available-cats-offsite/"),
 ]
-NTFY_TOPIC = "kaya-acct-kitten-9482"  # Telefondaki ntfy kanal adınla değiştir
+NTFY_TOPIC = "kaya-acct-kitten-9482"  # Telefondaki ntfy kanal adınla aynı yap
 STATE_FILE = "seen_cats.json"
 
 
@@ -27,7 +27,7 @@ def save_seen(data: dict) -> None:
 
 
 def is_likely_orange(img_url: str) -> bool:
-    if not img_url:
+    if not img_url or not img_url.startswith("http"):
         return False
     try:
         resp = requests.get(img_url, timeout=10)
@@ -51,7 +51,10 @@ def notify(title: str, body: str, click_url: str, img_url: str = "", urgent: boo
     }
     if img_url.startswith("http"):
         headers["Attach"] = img_url
-    requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=body.encode("utf-8"), headers=headers, timeout=15)
+    try:
+        requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=body.encode("utf-8"), headers=headers, timeout=15)
+    except Exception as e:
+        print(f"Bildirim hatasi: {e}")
 
 
 def apply_female_kitten_filter(target) -> bool:
@@ -60,53 +63,105 @@ def apply_female_kitten_filter(target) -> bool:
         if sex_btn.count() == 0:
             return False
         sex_btn.first.click()
-        target.wait_for_timeout(600)
+        target.wait_for_timeout(700)
         target.get_by_text("Female", exact=True).first.click()
-        target.wait_for_timeout(400)
+        target.wait_for_timeout(500)
         target.get_by_text("Done", exact=True).first.click()
-        target.wait_for_timeout(800)
+        target.wait_for_timeout(1000)
 
         age_btn = target.get_by_text("Age Group", exact=True)
         age_btn.first.click()
-        target.wait_for_timeout(600)
+        target.wait_for_timeout(700)
         target.get_by_text("Kitten", exact=True).first.click()
-        target.wait_for_timeout(400)
+        target.wait_for_timeout(500)
         target.get_by_text("Done", exact=True).first.click()
-        target.wait_for_timeout(1500)
+        target.wait_for_timeout(2000)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"Filtre uyarisi: {e}")
         return False
+
+
+def extract_cards_from_frame(frame, source_name: str, fallback_url: str) -> dict:
+    found = {}
+    ignore_names = {
+        "back to all available cats",
+        "donate",
+        "learn more at www.shelterluv.com",
+        "sex",
+        "attributes",
+        "age group",
+        "breed",
+        "sort",
+        "reset",
+        "done",
+    }
+
+    # 1. Link iceren hayvan kartlarini tara
+    for link in frame.query_selector_all("a[href]"):
+        href = link.get_attribute("href") or ""
+        name = re.sub(r"\s+", " ", (link.inner_text() or "")).strip()
+        if not name or len(name) < 2 or len(name) > 40 or name.lower() in ignore_names:
+            continue
+        img_el = link.query_selector("img")
+        if not img_el and "shelterluv" not in href.lower() and "animal" not in href.lower():
+            continue
+        img_url = (img_el.get_attribute("src") or "") if img_el else ""
+        full_url = href if href.startswith("http") else fallback_url
+        key = f"{source_name}:{name}:{href}"
+        found[key] = {
+            "name": name,
+            "source": source_name,
+            "url": full_url,
+            "img_url": img_url,
+        }
+
+    # 2. Shelterluv kartlari <a> yerine <div>/button olarak render edildiyse yakala
+    if not found:
+        for img in frame.query_selector_all("img"):
+            src = img.get_attribute("src") or ""
+            if not src or "logo" in src.lower() or "acct" in src.lower():
+                continue
+            parent = img.evaluate_handle("el => el.closest('a, button, [role=\"button\"], div')")
+            if not parent:
+                continue
+            text = re.sub(r"\s+", " ", (parent.as_element().inner_text() or "")).strip()
+            if 2 <= len(text) <= 35 and text.lower() not in ignore_names:
+                key = f"{source_name}:{text}"
+                found[key] = {
+                    "name": text,
+                    "source": source_name,
+                    "url": fallback_url,
+                    "img_url": src,
+                }
+
+    return found
 
 
 def scrape_kittens(page) -> dict:
     results = {}
     for source_name, url in URLS:
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(4000)
+        loaded = False
+        for attempt in range(2):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(5000)
+                loaded = True
+                break
+            except Exception as e:
+                print(f"[{source_name}] Deneme {attempt + 1} hatasi: {e}")
+                page.wait_for_timeout(2000)
+
+        if not loaded:
+            continue
 
         for frame in page.frames:
-            if not apply_female_kitten_filter(frame):
-                continue
-            links = frame.query_selector_all("a[href]")
-            for link in links:
-                href = link.get_attribute("href") or ""
-                name = re.sub(r"\s+", " ", (link.inner_text() or "")).strip()
-                if not name or len(name) < 2:
-                    continue
-                if name.lower() in {"back to all available cats", "donate", "learn more at www.shelterluv.com"}:
-                    continue
-                if "shelterluv.com" not in href and "animal" not in href.lower():
-                    continue
+            if apply_female_kitten_filter(frame):
+                cards = extract_cards_from_frame(frame, source_name, url)
+                print(f"[{source_name}] Filtrelenen disi yavru sayisi: {len(cards)}")
+                results.update(cards)
+                break
 
-                img_el = link.query_selector("img")
-                img_url = img_el.get_attribute("src") if img_el else ""
-                key = href if href.startswith("http") else f"{source_name}:{name}"
-                results[key] = {
-                    "name": name,
-                    "source": source_name,
-                    "url": href if href.startswith("http") else url,
-                    "img_url": img_url or "",
-                }
     return results
 
 
@@ -115,18 +170,35 @@ def main():
     is_initial = len(seen) == 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-http2",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.new_page()
         current = scrape_kittens(page)
         browser.close()
 
     if not current:
-        print("Liste yuklenemedi, sonraki calismada tekrar denenecek.")
+        print("Su an filtrelenmis disi yavru bulunamadi veya liste bos dondu.")
         return
 
     if is_initial:
         save_seen(current)
-        print(f"Ilk kayit tamamlandi: {len(current)} disi yavru kaydedildi.")
+        names = ", ".join(f"{v['name']} ({v['source']})" for v in current.values())
+        print(f"Ilk kayit tamamlandi: {names}")
+        notify(
+            title="✅ ACCT Takip Botu Aktif",
+            body=f"Su anki {len(current)} disi yavru kaydedildi ({names}). Yeni bir dişi yavru dustugunde aninda bildirim gelecek.",
+            click_url=URLS[0][1],
+        )
         return
 
     new_keys = [k for k in current if k not in seen]
