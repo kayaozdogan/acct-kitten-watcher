@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import sys
 import requests
 from PIL import Image
@@ -22,34 +23,56 @@ SOURCES = [
         ACCT_DOMAIN + "/available-cats/available-cats-offsite/",
     ),
 ]
-NTFY_TOPIC = "kaya-acct-kitten-9482"  # Telefondaki ntfy kanal adinla birebir ayni yap
+NTFY_TOPIC = "kaya-acct-kitten-9482"
 STATE_FILE = "seen_cats.json"
+SCHEMA_VERSION = 2
+MAX_AGE_MONTHS = 12.0  # 12 ay alti (yavru / genc) kediler
 
 
-def load_seen() -> dict:
+def load_checked() -> dict:
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("schema") == SCHEMA_VERSION:
+                return data.get("checked", {})
+        except Exception:
+            pass
     return {}
 
 
-def save_seen(data: dict) -> None:
+def save_checked(checked: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump({"schema": SCHEMA_VERSION, "checked": checked}, f, ensure_ascii=False, indent=2)
 
 
-def is_likely_orange(img_url: str) -> bool:
+def parse_age_months(age_str: str) -> float | None:
+    if not age_str:
+        return None
+    y_m = re.search(r"(\d+)\s*Y", age_str, re.I)
+    m_m = re.search(r"(\d+)\s*M", age_str, re.I)
+    w_m = re.search(r"(\d+)\s*W", age_str, re.I)
+    if not (y_m or m_m or w_m):
+        return None
+    years = int(y_m.group(1)) if y_m else 0
+    months = int(m_m.group(1)) if m_m else 0
+    weeks = int(w_m.group(1)) if w_m else 0
+    return years * 12.0 + months + (weeks / 4.3)
+
+
+def is_likely_orange(img_url: str, bio_text: str = "") -> bool:
+    if re.search(r"\b(orange|ginger|marmalade)\b", bio_text, re.I):
+        return True
     if not img_url or not img_url.startswith("http"):
         return False
     try:
         resp = requests.get(img_url, timeout=10)
         img = Image.open(io.BytesIO(resp.content)).convert("RGB")
         w, h = img.size
-        # Kenarlardaki kutu ve duvar rengini elemek icin sadece tam ortadaki kediye odaklan
+        # Kenarlardaki kafes/karton rengini elemek icin sadece ortadaki kediye odaklan
         center = img.crop((int(w * 0.30), int(h * 0.25), int(w * 0.70), int(h * 0.75)))
         hsv = center.convert("HSV").resize((60, 60))
         pixels = list(hsv.getdata())
-        # Turuncu tonu (H: 8-26), yuksek doygunluk (S > 95 -> soluk karton/bej elenir)
         orange_hits = sum(
             1 for h_val, s_val, v_val in pixels
             if 8 <= h_val <= 26 and s_val > 95 and v_val > 90
@@ -76,48 +99,22 @@ def notify(title: str, body: str, click_url: str, img_url: str = "", urgent: boo
             headers=headers,
             timeout=15,
         )
-        print(f"ntfy durum kodu: {r.status_code} -> kanal: {NTFY_TOPIC.strip()}")
+        print(f"ntfy durum kodu: {r.status_code}")
     except Exception as e:
         print(f"Bildirim hatasi: {e}")
 
 
-def select_filter_option(page, button_label: str, option_label: str) -> str:
-    triggers = page.get_by_text(button_label, exact=True).locator("visible=true")
-    if triggers.count() == 0:
-        return "UI_ERROR"
-
-    triggers.first.click()
-    page.wait_for_timeout(800)
-
-    options = page.get_by_text(option_label, exact=True).locator("visible=true")
-    if options.count() == 0:
-        triggers.first.click()
-        page.wait_for_timeout(400)
-        return "NO_MATCH"
-
-    options.first.click()
-    page.wait_for_timeout(600)
-
-    done_btns = page.get_by_text("Done", exact=True).locator("visible=true")
-    if done_btns.count() > 0:
-        done_btns.first.click()
-        page.wait_for_timeout(1500)
-    return "SELECTED"
-
-
-def extract_cats(page, source_name: str, fallback_url: str) -> dict:
-    found = {}
+def collect_listing_cards(page, source_name: str, fallback_url: str) -> list[dict]:
+    cards = []
+    seen_urls = set()
     imgs = page.locator("img:visible")
+
     for i in range(imgs.count()):
         img = imgs.nth(i)
         src = img.get_attribute("src") or ""
         alt = img.get_attribute("alt") or ""
         if not src or "logo" in src.lower():
             continue
-
-        name = ""
-        if "'s preview photo" in alt:
-            name = alt.replace("'s preview photo", "").strip()
 
         info = img.evaluate(
             """el => {
@@ -129,70 +126,63 @@ def extract_cats(page, source_name: str, fallback_url: str) -> dict:
                 };
             }"""
         )
+        href = info.get("href", "")
+        if not href:
+            continue
+
+        profile_url = (SL_DOMAIN + href) if href.startswith("/") else href
+        if profile_url in seen_urls:
+            continue
+        seen_urls.add(profile_url)
+
+        name = ""
+        if "'s preview photo" in alt:
+            name = alt.replace("'s preview photo", "").strip()
         if not name and info.get("text"):
             first_line = info["text"].splitlines()[0].strip()
             if 2 <= len(first_line) <= 40:
                 name = first_line
-
         if not name:
-            continue
+            name = "Isimsiz Kedi"
 
-        href = info.get("href", "")
-        if href.startswith("/"):
-            profile_url = SL_DOMAIN + href
-        elif href.startswith("http"):
-            profile_url = href
-        else:
-            profile_url = fallback_url
-
-        cat_id = f"{source_name}:{href or name}"
-        found[cat_id] = {
+        cards.append({
+            "id": f"{source_name}:{href}",
             "name": name,
             "source": source_name,
             "url": profile_url,
             "img_url": src,
-        }
-    return found
+        })
+    return cards
 
 
-def scrape_all(page) -> tuple[dict, int]:
-    all_cats = {}
-    successful_sources = 0
+def inspect_animal_profile(page, cat: dict) -> dict | None:
+    try:
+        page.goto(cat["url"], wait_until="networkidle", timeout=45000)
+        page.wait_for_timeout(1500)
+        body_text = page.inner_text("body")
+    except Exception as e:
+        print(f"  -> Profil acilamadi ({cat['name']}): {e}")
+        return None
 
-    for source_name, embed_url, public_url in SOURCES:
-        try:
-            page.goto(embed_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(3500)
-        except Exception as e:
-            print(f"[{source_name}] Baglanti hatasi: {e}")
-            continue
+    sex_match = re.search(r"\bSEX\s+(Female|Male)\b", body_text, re.I)
+    age_match = re.search(r"\bAGE\s+([0-9YMW/]+)", body_text, re.I)
 
-        sex_status = select_filter_option(page, "Sex", "Female")
-        if sex_status == "UI_ERROR":
-            snippet = " ".join(page.inner_text("body").split())[:220]
-            print(f"[{source_name}] HATA: Sex filtresi gorunmedi. Sayfa ozeti: {snippet}")
-            continue
+    sex = sex_match.group(1).capitalize() if sex_match else "Unknown"
+    age_raw = age_match.group(1).upper() if age_match else "Unknown"
+    age_months = parse_age_months(age_raw)
 
-        successful_sources += 1
-        if sex_status == "NO_MATCH":
-            print(f"[{source_name}] Basariyla tarandi -> Su an 0 Female kaydi var.")
-            continue
-
-        age_status = select_filter_option(page, "Age Group", "Kitten")
-        if age_status == "NO_MATCH":
-            print(f"[{source_name}] Basariyla tarandi -> Su an 0 Female + Kitten kaydi var.")
-            continue
-
-        cats = extract_cats(page, source_name, public_url)
-        print(f"[{source_name}] Basariyla tarandi -> {len(cats)} disi yavru bulundu: {[c['name'] for c in cats.values()]}")
-        all_cats.update(cats)
-
-    return all_cats, successful_sources
+    return {
+        "sex": sex,
+        "age_raw": age_raw,
+        "age_months": age_months,
+        "bio": body_text,
+    }
 
 
 def main():
-    is_initial = not os.path.exists(STATE_FILE)
-    seen = load_seen()
+    checked = load_checked()
+    all_cards = []
+    ok_sources = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -201,43 +191,69 @@ def main():
             viewport={"width": 1366, "height": 900},
         )
         page = context.new_page()
-        current, ok_count = scrape_all(page)
+
+        for source_name, embed_url, public_url in SOURCES:
+            try:
+                page.goto(embed_url, wait_until="networkidle", timeout=60000)
+                page.wait_for_timeout(3000)
+                cards = collect_listing_cards(page, source_name, public_url)
+                print(f"[{source_name}] Toplam {len(cards)} kedi karti listelendi.")
+                if len(cards) > 0:
+                    ok_sources += 1
+                all_cards.extend(cards)
+            except Exception as e:
+                print(f"[{source_name}] Liste hatasi: {e}")
+
+        if ok_sources == 0:
+            browser.close()
+            notify(
+                title="⚠️ ACCT Botu Listeyi Okuyamadı",
+                body="Shelterluv vitrinine ulasilamadi. GitHub Actions logunu kontrol et.",
+                click_url=ACCT_DOMAIN + "/available-cats/",
+                urgent=True,
+            )
+            sys.exit(1)
+
+        new_cards = [c for c in all_cards if c["id"] not in checked]
+        print(f"Daha once kontrol edilmemis yeni kedi sayisi: {len(new_cards)}")
+
+        for cat in new_cards:
+            details = inspect_animal_profile(page, cat)
+            if not details:
+                continue
+
+            sex = details["sex"]
+            age_raw = details["age_raw"]
+            age_months = details["age_months"]
+
+            checked[cat["id"]] = {
+                "name": cat["name"],
+                "source": cat["source"],
+                "sex": sex,
+                "age": age_raw,
+            }
+
+            is_female = (sex == "Female")
+            is_kitten = (age_months is not None and age_months < MAX_AGE_MONTHS)
+
+            if not (is_female and is_kitten):
+                print(f"  [ELENDI] {cat['name']} ({cat['source']}) -> Sex: {sex}, Age: {age_raw}")
+                continue
+
+            print(f"  [ESLESME!] {cat['name']} ({cat['source']}) -> Sex: {sex}, Age: {age_raw}")
+            orange = is_likely_orange(cat["img_url"], details["bio"])
+            tag = "🧡 SARMAN DİŞİ YAVRU" if orange else "🐱 Yeni Dişi Yavru"
+            title = f"{tag}: {cat['name']} ({age_raw})"
+            body = (
+                f"Konum: {cat['source']} | Cinsiyet: {sex} | Yaş: {age_raw}\n"
+                f"Durum: {'Sarman tonu tespit edildi!' if orange else 'Yeni disi yavru eklendi.'}\n"
+                f"Profilini acmak icin bildirime dokun."
+            )
+            notify(title=title, body=body, click_url=cat["url"], img_url=cat["img_url"], urgent=orange)
+
         browser.close()
 
-    if ok_count == 0:
-        notify(
-            title="⚠️ ACCT Botu Sayfayı Okuyamadı",
-            body="Shelterluv vitrinine ulasilamadi. GitHub Actions logunu kontrol et.",
-            click_url=ACCT_DOMAIN + "/available-cats/",
-            urgent=True,
-        )
-        sys.exit(1)
-
-    if is_initial:
-        save_seen(current)
-        names = ", ".join(f"{c['name']} ({c['source']})" for c in current.values()) or "su an 0 disi yavru var"
-        notify(
-            title="✅ ACCT Canlı Tarama Aktif",
-            body=f"Main Facility ve Offsite canli baglandi ({names}). Yeni disi yavru dustugunde fotografiyle bildirim gelecek.",
-            click_url=ACCT_DOMAIN + "/available-cats/",
-        )
-        return
-
-    new_keys = [k for k in current if k not in seen]
-    for key in new_keys:
-        cat = current[key]
-        orange = is_likely_orange(cat["img_url"])
-        tag = "🧡 SARMAN DİŞİ YAVRU" if orange else "🐱 Yeni Dişi Yavru"
-        title = f"{tag}: {cat['name']} ({cat['source']})"
-        body = (
-            f"Konum: {cat['source']}\n"
-            f"Durum: {'Sarman tonu tespit edildi!' if orange else 'Yeni disi yavru eklendi.'}\n"
-            f"Ilani acmak icin bildirime dokun."
-        )
-        notify(title=title, body=body, click_url=cat["url"], img_url=cat["img_url"], urgent=orange)
-
-    if current != seen:
-        save_seen(current)
+    save_checked(checked)
 
 
 if __name__ == "__main__":
