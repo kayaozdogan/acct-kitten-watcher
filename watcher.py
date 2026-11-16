@@ -166,7 +166,12 @@ def scrape_all(page) -> tuple[dict, int]:
         wrap_id = f"shelterluv_wrap_{saved_query}"
         html = build_embed_html(wrap_id, saved_query)
         virtual_url = ACCT_DOMAIN + f"/watcher-embed-{saved_query}"
-        page.route(virtual_url, lambda route, body=html: route.fulfill(status=200, content_type="text/html", body=body))
+        page.route(
+            virtual_url,
+            lambda route, request, body=html: route.fulfill(
+                status=200, content_type="text/html", body=body
+            ),
+        )
 
         try:
             page.goto(virtual_url, wait_until="networkidle", timeout=60000)
