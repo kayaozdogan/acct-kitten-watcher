@@ -43,13 +43,18 @@ def is_likely_orange(img_url: str) -> bool:
         return False
     try:
         resp = requests.get(img_url, timeout=10)
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB").resize((80, 80))
-        pixels = list(img.getdata())
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        w, h = img.size
+        # Kenarlardaki kutu ve duvar rengini elemek icin sadece tam ortadaki kediye odaklan
+        center = img.crop((int(w * 0.30), int(h * 0.25), int(w * 0.70), int(h * 0.75)))
+        hsv = center.convert("HSV").resize((60, 60))
+        pixels = list(hsv.getdata())
+        # Turuncu tonu (H: 8-26), yuksek doygunluk (S > 95 -> soluk karton/bej elenir)
         orange_hits = sum(
-            1 for r, g, b in pixels
-            if r > 155 and 75 < g < 195 and b < 115 and (r - b) > 55 and r > g
+            1 for h_val, s_val, v_val in pixels
+            if 8 <= h_val <= 26 and s_val > 95 and v_val > 90
         )
-        return (orange_hits / len(pixels)) > 0.14
+        return (orange_hits / len(pixels)) > 0.18
     except Exception:
         return False
 
